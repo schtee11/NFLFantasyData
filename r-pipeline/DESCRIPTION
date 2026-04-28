@@ -1,0 +1,44 @@
+Package: dynmod
+Title: Dynasty Rookie Projection Workbench
+Version: 0.1.0
+Authors@R: person("schtee", role = c("aut", "cre"), email = "schtee@local")
+Description: Hybrid comps + ML projection engine for dynasty rookie drafts.
+    Half-PPR + TE Premium 1.0. Personal analytics tool — not for distribution.
+License: file LICENSE
+Encoding: UTF-8
+LazyData: true
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Depends:
+    R (>= 4.3.0)
+Imports:
+    DBI,
+    RPostgres,
+    dplyr,
+    tidyr,
+    purrr,
+    readr,
+    stringr,
+    glue,
+    lubridate,
+    yaml,
+    janitor,
+    fs,
+    here,
+    rlang,
+    tibble,
+    cli
+Suggests:
+    nflreadr,
+    nflfastR,
+    cfbfastR,
+    tidymodels,
+    xgboost,
+    FNN,
+    stringdist,
+    quarto,
+    testthat (>= 3.2.0),
+    devtools,
+    httr2,
+    jsonlite
+Config/testthat/edition: 3

@@ -1,0 +1,17 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^renv$
+^renv\.lock$
+^cache$
+^logs$
+^scratch$
+^reports$
+^sql$
+^ingest$
+^features$
+^comps$
+^models$
+^ensemble$
+^tests/manual$
+^.*\.qmd$
+^_quarto\.yml$

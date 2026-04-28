@@ -1,0 +1,59 @@
+# env / secrets
+.env
+.env.local
+.env.*.local
+
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+*.Rcheck/
+*.tar.gz
+.Renviron
+
+# renv
+r-pipeline/renv/library/
+r-pipeline/renv/local/
+r-pipeline/renv/cellar/
+r-pipeline/renv/lock/
+r-pipeline/renv/python/
+r-pipeline/renv/staging/
+
+# model artifacts (committed via manifest hashes, not blobs)
+r-pipeline/models/artifacts/**/*.rds
+r-pipeline/models/artifacts/**/*.bin
+r-pipeline/models/artifacts/**/*.parquet
+
+# quarto build output
+**/_freeze/
+**/_book/
+**/_site/
+**/.quarto/
+**/*_files/
+**/*.html
+!design-reference/*.html
+
+# node / vite (Phase 8)
+web/node_modules/
+web/dist/
+web/.vite/
+
+# os
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# logs
+*.log
+r-pipeline/logs/
+
+# data dumps (raw scratch only — curated CSVs are committed)
+r-pipeline/scratch/
+r-pipeline/cache/
