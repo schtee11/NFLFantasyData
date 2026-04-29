@@ -41,5 +41,8 @@ Suggests:
     testthat (>= 3.2.0),
     devtools,
     httr2,
-    jsonlite
+    jsonlite,
+    ggplot2,
+    gt,
+    scales
 Config/testthat/edition: 3

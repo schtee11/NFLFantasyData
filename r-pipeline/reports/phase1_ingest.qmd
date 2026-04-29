@@ -1,0 +1,268 @@
+---
+title: "dynmod — Phase 1 ingestion sanity report"
+subtitle: "Row counts, coverage, missing-data audit"
+date: today
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  devtools::load_all(here::here("r-pipeline"), quiet = TRUE)
+  library(dplyr)
+  library(ggplot2)
+  library(gt)
+})
+load_env()
+con <- db_connect()
+on.exit(db_disconnect(con), add = TRUE)
+
+dynmod_theme <- function() {
+  ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      strip.background = ggplot2::element_rect(fill = "#222", color = NA),
+      strip.text       = ggplot2::element_text(color = "white", face = "bold"),
+      plot.title       = ggplot2::element_text(face = "bold")
+    )
+}
+```
+
+## Top-line counts
+
+```{r counts}
+counts <- DBI::dbGetQuery(con, "
+  SELECT 'players'         AS table_name, COUNT(*)::int AS rows FROM players UNION ALL
+  SELECT 'cfb_seasons',     COUNT(*)::int FROM cfb_seasons UNION ALL
+  SELECT 'cfb_advanced',    COUNT(*)::int FROM cfb_advanced UNION ALL
+  SELECT 'combine',         COUNT(*)::int FROM combine UNION ALL
+  SELECT 'nfl_outcomes',    COUNT(*)::int FROM nfl_outcomes UNION ALL
+  SELECT 'consensus_ranks', COUNT(*)::int FROM consensus_ranks UNION ALL
+  SELECT 'match_overrides', COUNT(*)::int FROM match_overrides UNION ALL
+  SELECT 'position_overrides', COUNT(*)::int FROM position_overrides;
+")
+
+counts |>
+  gt() |>
+  tab_header(title = "Table sizes") |>
+  fmt_integer(columns = "rows", sep_mark = ",")
+```
+
+## Players by position × draft year
+
+```{r players-by-pos-year}
+players <- DBI::dbGetQuery(con, "
+  SELECT pos, draft_year, COUNT(*)::int AS n
+  FROM players
+  GROUP BY pos, draft_year
+  ORDER BY draft_year, pos;
+")
+
+ggplot(players, aes(x = draft_year, y = pos, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = n), color = "white", size = 3.2) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(title = "Drafted skill-position players, by class",
+       x = "draft year", y = "position", fill = "count") +
+  dynmod_theme()
+```
+
+## Coverage of supporting tables
+
+```{r coverage}
+cov <- DBI::dbGetQuery(con, "
+  SELECT
+    p.pos,
+    COUNT(*)::int                              AS drafted,
+    SUM(CASE WHEN c.player_id   IS NOT NULL THEN 1 ELSE 0 END)::int AS combine,
+    SUM(CASE WHEN s.player_id   IS NOT NULL THEN 1 ELSE 0 END)::int AS any_cfb,
+    SUM(CASE WHEN o.player_id   IS NOT NULL THEN 1 ELSE 0 END)::int AS any_outcome,
+    SUM(CASE WHEN cr.player_id  IS NOT NULL THEN 1 ELSE 0 END)::int AS any_adp
+  FROM players p
+  LEFT JOIN combine          c USING (player_id)
+  LEFT JOIN (SELECT DISTINCT player_id FROM cfb_seasons)    s USING (player_id)
+  LEFT JOIN (SELECT DISTINCT player_id FROM nfl_outcomes)   o USING (player_id)
+  LEFT JOIN (SELECT DISTINCT player_id FROM consensus_ranks) cr USING (player_id)
+  GROUP BY p.pos
+  ORDER BY p.pos;
+")
+
+cov |>
+  mutate(
+    combine_pct     = combine     / drafted,
+    any_cfb_pct     = any_cfb     / drafted,
+    any_outcome_pct = any_outcome / drafted,
+    any_adp_pct     = any_adp     / drafted
+  ) |>
+  select(pos, drafted, combine, combine_pct, any_cfb, any_cfb_pct,
+         any_outcome, any_outcome_pct, any_adp, any_adp_pct) |>
+  gt() |>
+  tab_header(title = "Per-position coverage") |>
+  fmt_percent(columns = ends_with("_pct"), decimals = 1) |>
+  fmt_integer(columns = c("drafted", "combine", "any_cfb", "any_outcome", "any_adp"))
+```
+
+## CFB advanced-metric availability
+
+The Phase 1b ingest computes market shares from team totals. YPRR and the
+QB advanced metrics (EPA/play, CPOE, pressure rate) require the PFF tier
+of CFBD and are deferred. This section shows what fraction of seasons we
+have each metric for.
+
+```{r cfb-adv}
+adv <- DBI::dbGetQuery(con, "
+  SELECT
+    COUNT(*)::int AS rows,
+    SUM(CASE WHEN dominator_rating  IS NOT NULL THEN 1 ELSE 0 END)::int AS dominator,
+    SUM(CASE WHEN market_share_yds  IS NOT NULL THEN 1 ELSE 0 END)::int AS ms_yds,
+    SUM(CASE WHEN market_share_tds  IS NOT NULL THEN 1 ELSE 0 END)::int AS ms_tds,
+    SUM(CASE WHEN target_share      IS NOT NULL THEN 1 ELSE 0 END)::int AS target_sh,
+    SUM(CASE WHEN yprr              IS NOT NULL THEN 1 ELSE 0 END)::int AS yprr,
+    SUM(CASE WHEN epa_per_play      IS NOT NULL THEN 1 ELSE 0 END)::int AS epa,
+    SUM(CASE WHEN breakout_age      IS NOT NULL THEN 1 ELSE 0 END)::int AS breakout
+  FROM cfb_advanced;
+")
+
+adv_long <- tidyr::pivot_longer(adv, -rows, names_to = "metric", values_to = "n")
+adv_long$pct <- adv_long$n / adv_long$rows
+
+ggplot(adv_long, aes(x = reorder(metric, pct), y = pct)) +
+  geom_col(fill = "#2563eb") +
+  geom_text(aes(label = scales::percent(pct, accuracy = 0.1)),
+            hjust = -0.1, size = 3.2) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1.1), expand = c(0, 0)) +
+  coord_flip() +
+  labs(title = "cfb_advanced metric coverage",
+       x = NULL, y = "fraction of seasons populated") +
+  dynmod_theme()
+```
+
+## NFL outcomes by season number
+
+How many rookie / Y2 / Y3 seasons do we have per position? This is the
+denominator for downstream per-year projection RMSE.
+
+```{r outcomes}
+outc <- DBI::dbGetQuery(con, "
+  SELECT p.pos, o.season_number, COUNT(*)::int AS n
+  FROM nfl_outcomes o
+  JOIN players p USING (player_id)
+  WHERE o.season_number BETWEEN 1 AND 5
+  GROUP BY p.pos, o.season_number
+  ORDER BY p.pos, o.season_number;
+")
+
+ggplot(outc, aes(x = factor(season_number), y = n, fill = pos)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ pos, scales = "free_y") +
+  labs(title = "NFL outcome rows per (position × season number)",
+       x = "season number (1 = rookie)", y = "rows") +
+  dynmod_theme() +
+  theme(legend.position = "none")
+```
+
+## Combine measurables: missing-data histograms
+
+```{r combine-missing, fig.height=3.5}
+comb <- DBI::dbGetQuery(con, "
+  SELECT p.pos, c.height_in, c.weight_lb, c.forty, c.vertical, c.broad,
+         c.three_cone, c.shuttle, c.ras
+  FROM players p
+  LEFT JOIN combine c USING (player_id);
+")
+
+miss <- comb |>
+  tidyr::pivot_longer(-pos, names_to = "metric", values_to = "v") |>
+  group_by(pos, metric) |>
+  summarise(missing_pct = mean(is.na(v)), .groups = "drop")
+
+ggplot(miss, aes(x = metric, y = pos, fill = missing_pct)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = scales::percent(missing_pct, accuracy = 1)),
+            color = "white", size = 3) +
+  scale_fill_viridis_c(option = "B", direction = 1, labels = scales::percent_format()) +
+  labs(title = "Combine missing-data heatmap",
+       subtitle = "denominator = drafted skill-position players",
+       x = NULL, y = NULL, fill = "% missing") +
+  dynmod_theme()
+```
+
+## RAS-style distribution by position
+
+```{r ras-dist, fig.height=3.5}
+ras <- DBI::dbGetQuery(con, "
+  SELECT p.pos, c.ras
+  FROM players p JOIN combine c USING (player_id)
+  WHERE c.ras IS NOT NULL;
+")
+
+ggplot(ras, aes(x = ras, fill = pos)) +
+  geom_histogram(bins = 20, alpha = 0.85, color = "white") +
+  facet_wrap(~ pos, nrow = 1) +
+  scale_x_continuous(limits = c(0, 10)) +
+  labs(title = "RAS-style composite distribution by position",
+       subtitle = "expected to center near 5 within each position",
+       x = "RAS-style score", y = "count") +
+  dynmod_theme() +
+  theme(legend.position = "none")
+```
+
+## Recent ingestion runs
+
+```{r recent-runs}
+runs <- DBI::dbGetQuery(con, "
+  SELECT source, status, started_at, completed_at,
+         rows_inserted, rows_updated, rows_skipped, notes
+  FROM ingestion_runs
+  ORDER BY started_at DESC
+  LIMIT 20;
+")
+
+runs |>
+  gt() |>
+  tab_header(title = "Last 20 ingestion runs") |>
+  fmt_datetime(columns = c("started_at", "completed_at"))
+```
+
+## ID coverage on players
+
+```{r id-cov}
+DBI::dbGetQuery(con, "
+  SELECT
+    p.pos,
+    COUNT(*)::int AS players,
+    SUM(CASE WHEN gsis_id    IS NOT NULL THEN 1 ELSE 0 END)::int AS has_gsis,
+    SUM(CASE WHEN pfr_id     IS NOT NULL THEN 1 ELSE 0 END)::int AS has_pfr,
+    SUM(CASE WHEN sleeper_id IS NOT NULL THEN 1 ELSE 0 END)::int AS has_sleeper
+  FROM players p
+  GROUP BY p.pos
+  ORDER BY p.pos;
+") |>
+  gt() |>
+  tab_header(title = "External ID coverage")
+```
+
+## Match-review queue
+
+```{r review-queue}
+review_path <- here::here("r-pipeline", "ingest", "data", "cfb_match_review.csv")
+if (file.exists(review_path)) {
+  rev <- readr::read_csv(review_path, show_col_types = FALSE)
+  cat("**", nrow(rev), "rows in cfb_match_review.csv awaiting review.**\n\n")
+  rev |>
+    head(50) |>
+    gt() |>
+    tab_header(title = "First 50 rows of CFB match review queue")
+} else {
+  cat("_No review queue — `cfb_match_review.csv` not present (either ingest_cfb hasn't run or there were no flagged matches)._\n")
+}
+```
+
+## Sign-off checklist
+
+- [ ] Top-line counts roughly match expectations (~1,500 players, ~5,000 cfb_seasons)
+- [ ] No position has < 30 drafted players in its training window
+- [ ] Combine coverage > 70% per position
+- [ ] CFB coverage > 80% (some FCS players may legitimately have no CFBD data)
+- [ ] No ingestion run in `ingestion_runs` has status = 'failed'
+- [ ] `cfb_match_review.csv` queue manageable (< 50 rows, ideally < 20)
+- [ ] RAS distributions visually centered near 5 per position

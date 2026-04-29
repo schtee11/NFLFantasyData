@@ -101,8 +101,8 @@ cd web && npm install && npm run dev
 ## Phase status
 
 - [x] Phase 1a — schema + infra
-- [ ] Phase 1b — ingestion scripts
-- [ ] Phase 1c — match + seed + report
+- [x] Phase 1b — ingestion scripts
+- [x] Phase 1c — match + seed + report
 - [ ] Phase 2 — feature engineering
 - [ ] Phase 3 — sub-scores
 - [ ] Phase 4 — similarity model
