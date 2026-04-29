@@ -27,7 +27,8 @@ Imports:
     here,
     rlang,
     tibble,
-    cli
+    cli,
+    digest
 Suggests:
     nflreadr,
     nflfastR,
