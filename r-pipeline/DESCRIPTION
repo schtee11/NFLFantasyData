@@ -44,5 +44,6 @@ Suggests:
     jsonlite,
     ggplot2,
     gt,
-    scales
+    scales,
+    glmnet
 Config/testthat/edition: 3

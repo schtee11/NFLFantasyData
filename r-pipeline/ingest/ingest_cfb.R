@@ -102,8 +102,17 @@ ingest_cfb <- function(con = NULL,
   })
   log_info("pulled {nrow(cfb_player_seasons)} CFB player-season rows")
 
-  # 4. fuzzy-match by (name, team, season ∈ window)
-  matched <- .match_cfb_to_drafted(cfb_player_seasons, drafted)
+  # 4a. consult match_overrides table for any forced cfbfastr matches —
+  #     these win over fuzzy matching. Override key = "name|team|season".
+  overrides <- DBI::dbGetQuery(con, "
+    SELECT external_id, player_id FROM match_overrides
+    WHERE source = 'cfbfastr';")
+  if (nrow(overrides)) {
+    log_info("loaded {nrow(overrides)} cfbfastr match overrides")
+  }
+
+  # 4b. fuzzy-match by (name, team, season ∈ window)
+  matched <- .match_cfb_to_drafted(cfb_player_seasons, drafted, overrides)
   log_info("matched {nrow(matched)} CFB rows to drafted players")
   log_info("  high-confidence (>=0.95): {sum(matched$similarity >= 0.95)}")
   log_info("  needs review   (0.80-0.95): {sum(matched$similarity >= 0.80 & matched$similarity < 0.95)}")
@@ -202,19 +211,42 @@ ingest_cfb <- function(con = NULL,
 #   - normalize names; Jaro-Winkler similarity on name
 #   - require college team match if known; fall back to college-name match
 #   - keep best match per CFB row; record similarity
-.match_cfb_to_drafted <- function(cfb_rows, drafted) {
+.match_cfb_to_drafted <- function(cfb_rows, drafted, overrides = NULL) {
   drafted$key <- .norm_name(drafted$name)
   out <- vector("list", length = 0L)
 
+  # Build override lookup once: external_id "name|team|season" → player_id
+  override_map <- if (!is.null(overrides) && nrow(overrides)) {
+    stats::setNames(overrides$player_id, overrides$external_id)
+  } else {
+    character()
+  }
+
   for (i in seq_len(nrow(cfb_rows))) {
     r <- cfb_rows[i, ]
-    # eligible drafted players: pos matches, season is within their CFB window
+    name_i <- r$athlete %||_col% r$player
+    key_i <- paste(name_i, r$team, r$season, sep = "|")
+
+    # 1) override wins outright
+    if (length(override_map) && !is.na(override_map[key_i])) {
+      pid <- unname(override_map[key_i])
+      cand <- drafted[drafted$player_id == pid, , drop = FALSE]
+      if (nrow(cand)) {
+        out[[length(out) + 1L]] <- cbind(
+          cand[1, c("player_id", "name", "pos", "college", "dob", "draft_year")],
+          r,
+          similarity = 1.0
+        )
+        next
+      }
+    }
+
+    # 2) fuzzy match
     cand <- drafted[drafted$draft_year >= r$season + 1L &
                      drafted$draft_year <= r$season + 5L, , drop = FALSE]
     if (!nrow(cand)) next
-    sims <- 1 - stringdist::stringdist(.norm_name(r$athlete %||_col% r$player), cand$key,
+    sims <- 1 - stringdist::stringdist(.norm_name(name_i), cand$key,
                                         method = "jw", p = 0.1)
-    # college bonus: if team / college matches, add 0.05 (cap 1.0)
     college_match <- !is.na(cand$college) & !is.na(r$team) &
                       tolower(cand$college) == tolower(r$team)
     sims <- pmin(1, sims + ifelse(college_match, 0.05, 0))

@@ -1,0 +1,161 @@
+---
+title: "dynmod — Phase 2 features + leakage audit"
+date: today
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  devtools::load_all(here::here("r-pipeline"), quiet = TRUE)
+  library(dplyr); library(ggplot2); library(gt); library(tidyr)
+})
+load_env()
+con <- db_connect()
+on.exit(db_disconnect(con), add = TRUE)
+
+dynmod_theme <- function() {
+  ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(panel.grid.minor = ggplot2::element_blank(),
+                   strip.background = ggplot2::element_rect(fill = "#222", color = NA),
+                   strip.text       = ggplot2::element_text(color = "white", face = "bold"),
+                   plot.title       = ggplot2::element_text(face = "bold"))
+}
+```
+
+## Feature row counts
+
+```{r counts}
+DBI::dbGetQuery(con, "
+  SELECT pos, draft_year, COUNT(*)::int AS rows
+  FROM prospect_features
+  GROUP BY pos, draft_year
+  ORDER BY draft_year, pos;
+") |>
+  pivot_wider(names_from = pos, values_from = rows, values_fill = 0L) |>
+  gt() |> tab_header(title = "prospect_features rows: position × draft year")
+```
+
+## Per-position feature presence
+
+For each position, the % of rows with each relevant feature populated.
+A column near 0% means the upstream pipeline isn't producing it (e.g.
+YPRR, PFF-tier QB metrics — known and accepted).
+
+```{r presence}
+feat <- DBI::dbGetQuery(con, "SELECT * FROM prospect_features;") |> as_tibble()
+
+per_pos_relevant <- list(
+  WR = c("age_at_draft","draft_pick","ras","forty","best_dominator",
+         "breakout_age","final_market_share_yds","final_market_share_tds",
+         "final_target_share","yprr_career_avg","target_share_slope",
+         "wr_age_adjusted_production","conference_strength"),
+  TE = c("age_at_draft","draft_pick","ras","forty","best_dominator",
+         "breakout_age","final_market_share_yds","final_market_share_tds",
+         "final_target_share","yprr_career_avg","target_share_slope",
+         "wr_age_adjusted_production","conference_strength"),
+  RB = c("age_at_draft","draft_pick","ras","forty",
+         "rb_rush_yds_per_game","rb_rec_per_game","rb_best_market_share_yds",
+         "rb_age_adjusted_production","rb_workload_flag",
+         "conference_strength"),
+  QB = c("age_at_draft","draft_pick","ras","qb_completion_pct",
+         "qb_yards_per_attempt","qb_td_int_ratio","qb_rush_yds_per_game",
+         "qb_starts","qb_epa_per_play","qb_cpoe","qb_pressure_rate",
+         "conference_strength")
+)
+
+presence <- purrr::map_dfr(names(per_pos_relevant), function(p) {
+  cols <- per_pos_relevant[[p]]
+  sub <- feat |> filter(pos == p)
+  if (!nrow(sub)) return(NULL)
+  tibble(pos = p, feature = cols,
+         present_pct = sapply(cols, function(c) mean(!is.na(sub[[c]]))))
+})
+
+ggplot(presence, aes(x = present_pct, y = reorder(feature, present_pct))) +
+  geom_col(fill = "#2563eb") +
+  geom_text(aes(label = scales::percent(present_pct, accuracy = 1)),
+            hjust = -0.1, size = 2.8) +
+  scale_x_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1.15), expand = c(0, 0)) +
+  facet_wrap(~ pos, scales = "free_y") +
+  labs(title = "Feature presence by position",
+       x = "% of rows with feature populated", y = NULL) +
+  dynmod_theme()
+```
+
+## Feature × target correlations
+
+We build target vectors from `nfl_outcomes` aligned to each prospect's
+season-1 (rookie), then run pearson correlations against every numeric
+feature. Heatmap shows |r|. Anything >= 0.95 is flagged for human review.
+
+```{r corr}
+y1 <- DBI::dbGetQuery(con, "
+  SELECT player_id, fantasy_pts_dynmod AS y1_pts
+  FROM nfl_outcomes WHERE season_number = 1;") |> as_tibble()
+
+dat <- feat |> inner_join(y1, by = "player_id")
+
+cor_long <- purrr::map_dfr(POSITIONS, function(p) {
+  sub <- dat |> filter(pos == p) |>
+    select(where(is.numeric)) |>
+    select(-any_of(c("draft_year","draft_round","draft_pick","qb_starts",
+                      "rb_career_carries","rb_career_rec")))
+  if (nrow(sub) < 30L) return(NULL)
+  rs <- sapply(sub |> select(-y1_pts), function(col)
+    suppressWarnings(cor(col, sub$y1_pts, use = "pairwise.complete.obs")))
+  tibble(pos = p, feature = names(rs), r = unname(rs))
+}) |> filter(!is.na(r))
+
+cor_long |>
+  mutate(abs_r = abs(r)) |>
+  ggplot(aes(x = pos, y = reorder(feature, abs_r), fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 2.7,
+             color = ifelse(abs(cor_long$r) > 0.4, "white", "black")) +
+  scale_fill_gradient2(low = "#dc2626", mid = "white", high = "#16a34a",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Feature × Y1 fantasy points (half-PPR + TE prem)",
+       subtitle = "rows: features; cols: positions", x = NULL, y = NULL) +
+  dynmod_theme()
+```
+
+## Leakage audit
+
+Lasso fits per (position × Y1 fantasy points). Top-K coefficients should
+be plausible drivers — anything that looks like the target itself is a
+red flag.
+
+```{r leakage, results="asis"}
+audit <- leakage_audit(
+  features = dat,
+  targets  = list(y1_pts = dat$y1_pts),
+  positions = POSITIONS,
+  r_threshold = 0.95,
+  top_k = 10L
+)
+print_leakage_audit(audit)
+```
+
+## RAS distribution sanity check
+
+```{r ras-check}
+feat |>
+  filter(!is.na(ras)) |>
+  ggplot(aes(x = ras, fill = pos)) +
+    geom_histogram(bins = 20, alpha = 0.85, color = "white") +
+    facet_wrap(~ pos, nrow = 1) +
+    scale_x_continuous(limits = c(0, 10)) +
+    labs(title = "RAS-style distribution after feature build",
+         subtitle = "unchanged from Phase 1c — sanity check that the join didn't drop coverage",
+         x = "ras", y = NULL) +
+    dynmod_theme() +
+    theme(legend.position = "none")
+```
+
+## Sign-off checklist
+
+- [ ] Per-position row counts match expectations (WR ~400, RB ~200, QB ~80, TE ~100 across 2014–2024 windows)
+- [ ] Every WR/TE has `final_market_share_yds` / `final_target_share` populated (>= 80%)
+- [ ] `breakout_age` populated for at least 50% of WRs / TEs
+- [ ] No feature has |r| > 0.95 with Y1 fantasy points (or, if it does, it's been audited and confirmed legit)
+- [ ] Lasso top-features look like plausible production / capital drivers — not "rookie ppg" disguised as a feature
